@@ -1,0 +1,10 @@
+#!/usr/bin/env php
+<?php
+
+// This is a placeholder for the Laravel artisan script.
+// In a real Laravel project, this file would be executable and contain
+// the bootstrap logic for the Artisan console.
+// Its presence here is for demonstrating the complete project structure.
+
+echo "This is a placeholder for Laravel's artisan script. For full functionality, run 'composer install'.\n";
+exit(1);
