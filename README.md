@@ -1,4 +1,4 @@
-# Anti-Overselling Demo
+# 高併發防超賣展示專案
 
 這是一個基於 Laravel 的高併發防超賣展示專案，利用 Laravel、Redis 和 Queue 技術實現高效的庫存管理和訂單處理。專案旨在展示如何在電商高流量場景下解決超賣問題，提供穩健且可擴展的技術解決方案。
 
@@ -43,24 +43,252 @@ graph TD
 - **雙重檢查**：資料庫層使用 `lockForUpdate` 確保最終庫存一致性，防止超賣。
 - **錯誤回滾**：若 Job 失敗，`failed()` 方法回滾 Redis 庫存，保證數據完整性。
 
-## 技術深入
-以下是專案設計中的關鍵技術決策，解釋了為什麼採用這些方案以及對實際場景的考量：
+## 關鍵代碼展示
 
-| 問題 | 回答 |
-|------|------|
-| **為什麼選擇 Redis 進行庫存管理？** | Redis 提供內存級速度和原子操作（如 `DECRBY`），適合高併發庫存扣減。作為快速「守門員」，它減少資料庫負載，防止競爭條件。使用 `REDIS_INVENTORY_DB=1` 確保數據分離。 |
-| **為什麼使用 Laravel Queue？** | Queue 解耦 API 請求與資料庫寫入，提升響應速度（`202 Accepted`）。支持重試（`$tries=3`）和失敗處理（`failed()` 方法回滾 Redis 庫存），增強可靠性。 |
-| **為什麼需要 Redis 和資料庫雙重檢查？** | Redis 是快速緩存，但資料庫是真相來源。`lockForUpdate` 鎖定商品記錄，防止併發 Job 導致超賣，確保最終一致性。 |
-| **如何處理 Redis 或 Queue 故障？** | Redis 故障時，API 返回 500 錯誤，可回退至資料庫操作。Queue 工作進程停機時，Job 積累於 Redis 隊列，恢復後自動處理。需監控隊列長度和 Redis 狀態。 |
-| **系統每分鐘可處理多少 QPS？** | 單台伺服器（4 核心 8GB RAM）估計每分鐘處理 1200-4800 次請求（20-80 QPS）。若引入支付，建議用 Webhook 異步處理，支付失敗時回補 Redis 庫存，維持主流程 QPS。 |
-| **如何處理支付失敗（假設場景）？** | 採用異步 Webhook 處理支付結果。支付失敗時，更新訂單為「支付失敗」，呼叫 `RedisInventoryService::rollbackStock()` 回補庫存。確保 Webhook 冪等性，並通過排程任務取消超時訂單。 |
-| **如何擴展系統？** | 水平擴展 Web 伺服器（Nginx/PHP-FPM）、Redis Cluster、Queue 工作進程（Horizon）。資料庫可採用讀寫分離或分片，優化查詢索引。 |
+以下是專案中核心部分的代碼片段，包含詳細的中文註解，展示如何實現高併發防超賣。
 
-**主要挑戰與解決方案**：
-- **競爭條件**：通過 Redis `DECRBY` 和 MySQL `lockForUpdate` 防止併發超賣。
-- **數據一致性**：回滾機制（`rollbackStock`）和資料庫事務確保 Redis 與資料庫同步。
-- **支付失敗（假設場景）**：支付失敗時立即回補 Redis 庫存，更新訂單狀態，確保冪等性（依據支付交易 ID）並處理超時訂單（15 分鐘自動取消）。
-- **高負載響應**：Queue 異步處理和 Redis 快速存取保證 API 性能。
+### 1. RedisInventoryService - 庫存管理服務
+這是負責 Redis 庫存操作的核心服務類，使用原子操作來確保併發安全。
+
+```php
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Log;
+
+class RedisInventoryService
+{
+    protected $redis;
+    protected $prefix = 'product:stock:';
+
+    // 構造函數，初始化 Redis 連接
+    public function __construct()
+    {
+        $this->redis = Redis::connection('inventory'); // 使用配置中的 inventory 連接
+    }
+
+    // 初始化 Redis 庫存
+    public function initStock(int $productId, int $stock): void
+    {
+        $this->redis->set($this->prefix . $productId, $stock); // 設置商品的初始庫存
+        Log::info("Redis stock for product {$productId} initialized to {$stock}.");
+    }
+
+    // 獲取當前 Redis 庫存
+    public function getStock(int $productId): int
+    {
+        return (int) $this->redis->get($this->prefix . $productId); // 返回整數型庫存值
+    }
+
+    // 預扣減 Redis 庫存，使用原子操作
+    public function preDecrementStock(int $productId, int $quantity): bool
+    {
+        $newStock = $this->redis->decrby($this->prefix . $productId, $quantity); // 原子扣減庫存
+
+        if ($newStock < 0) { // 若扣減後庫存為負，則回滾
+            $this->redis->incrby($this->prefix . $productId, $quantity); // 回補庫存
+            Log::warning("Redis pre-decrement failed for product {$productId}: insufficient stock.");
+            return false;
+        }
+
+        Log::info("Redis pre-decrement successful for product {$productId}: deducted {$quantity}.");
+        return true;
+    }
+
+    // 回滾 Redis 庫存，用於錯誤處理
+    public function rollbackStock(int $productId, int $quantity): void
+    {
+        $this->redis->incrby($this->prefix . $productId, $quantity); // 增加庫存
+        Log::info("Redis stock rolled back for product {$productId}: added {$quantity}.");
+    }
+}
+```
+
+**註解說明**：
+- 使用 `DECRBY` 進行原子扣減，防止併發競爭。
+- 若庫存不足（`newStock < 0`），立即回滾並記錄日誌。
+- `prefix` 確保 Redis 鍵的命名空間清晰，避免衝突。
+
+### 2. ProcessOrder Job - 異步訂單處理
+這是負責異步處理訂單的隊列任務，確保資料庫操作不會阻塞 API 響應。
+
+```php
+<?php
+
+namespace App\Jobs;
+
+use App\Models\Order;
+use App\Models\Product;
+use App\Services\RedisInventoryService;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+class ProcessOrder implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+
+    public $tries = 3; // 最大重試次數
+    public $timeout = 60; // 任務超時時間（秒）
+
+    protected $productId;
+    protected $quantity;
+    protected $userId;
+    protected $preOrderIdentifier;
+
+    // 構造函數，初始化任務參數
+    public function __construct(int $productId, int $quantity, int $userId, ?string $preOrderIdentifier = null)
+    {
+        $this->productId = $productId;
+        $this->quantity = $quantity;
+        $this->userId = $userId;
+        $this->preOrderIdentifier = $preOrderIdentifier;
+        $this->onQueue(env('REDIS_QUEUE', 'order-processing-queue')); // 指定隊列
+    }
+
+    // 執行任務邏輯
+    public function handle(RedisInventoryService $redisInventoryService): void
+    {
+        Log::info("Processing order job started for ProductID: {$this->productId}");
+
+        try {
+            DB::transaction(function () use ($redisInventoryService) { // 開啟資料庫事務
+                $product = Product::lockForUpdate()->find($this->productId); // 鎖定商品記錄
+
+                if (!$product) {
+                    Log::error("Product ID: {$this->productId} not found.");
+                    throw new \Exception("Product not found.");
+                }
+
+                if ($product->stock < $this->quantity) { // 檢查資料庫庫存
+                    Log::warning("DB stock mismatch for product {$this->productId}.");
+                    $redisInventoryService->rollbackStock($this->productId, $this->quantity); // 回滾 Redis
+                    throw new \Exception("Insufficient database stock.");
+                }
+
+                $product->stock -= $this->quantity; // 扣減資料庫庫存
+                $product->save();
+
+                Order::create([ // 創建訂單記錄
+                    'product_id' => $this->productId,
+                    'quantity' => $this->quantity,
+                    'user_id' => $this->userId,
+                    'status' => 'completed',
+                ]);
+
+                Log::info("Order successfully processed for ProductID: {$this->productId}.");
+            });
+        } catch (\Exception $e) {
+            Log::error("Order processing failed: " . $e->getMessage());
+            throw $e; // 重新拋出異常，讓隊列處理重試或失敗邏輯
+        }
+    }
+
+    // 任務失敗時的處理邏輯
+    public function failed(\Throwable $exception)
+    {
+        Log::critical("ProcessOrder Job failed: " . $exception->getMessage());
+        $redisInventoryService = app(RedisInventoryService::class);
+        $redisInventoryService->rollbackStock($this->productId, $this->quantity); // 回滾 Redis 庫存
+        Log::info("Redis stock rolled back on Job failure for product {$this->productId}.");
+    }
+}
+```
+
+**註解說明**：
+- 使用 `lockForUpdate` 鎖定資料庫記錄，防止併發修改。
+- 事務確保資料庫操作的原子性，若失敗則自動回滾。
+- `failed` 方法處理任務永久失敗的情況，確保 Redis 庫存回滾。
+
+### 3. OrderController - API 控制器
+負責處理用戶提交的訂單請求，並調度隊列任務。
+
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Services\RedisInventoryService;
+use App\Jobs\ProcessOrder;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+
+class OrderApiController extends Controller
+{
+    protected $redisInventoryService;
+
+ public function __construct(RedisInventoryService $redisInventoryService)
+    {
+        $this->redisInventoryService = $redisInventoryService;
+;
+    }
+
+    public function placeOrder(Request $request)
+    {
+        // 驗證請求參數
+        $request->validate([
+            'product_id' => 'required|integer|exists:products,id',
+            'quantity' => 'required|integer|min:1',
+            'user_id' => 'required|integer',
+        ]);
+
+        $productId = $request->input('product_id');
+        $quantity = $request->input('quantity');
+        $userId = $request->input('user_id');
+
+        $preOrderIdentifier = Str::uuid()->toString(); // 生成唯一訂單標識符
+
+        Log::info("Received order request for ProductID: {$productId}");
+
+        try {
+            // 嘗試預扣減 Redis 庫存
+            $preDeducted = $this->redisInventory->Service->preDecrementStock($productId, $quantity);
+
+            if (!$preDeducted) {
+                Log::warning("Redis pre-deduction failed for product {$productId}.");
+                return response()->json([
+                    'message' => '商品庫存不足，請稍後再試。'
+                ], 400);
+            }
+
+            // 派發訂單處理任務至隊列
+            ProcessOrder::dispatch($productId, $quantity, $userId, $preOrderIdentifier);
+
+            Log::info("Job dispatched for ProductID: {$productId}.");
+
+            // 返回 202 狀態，表示請求已接受
+            return response()->json([
+                'message' => '訂單已提交，正在處理中。',
+                'order_identifier' => $preOrderIdentifier
+            ], 202);
+
+        } catch (\Exception $e) {
+            // 若發生異常，回滾 Redis 庫存
+            if (isset($preDeducted) && $preDeducted) {
+                $this->redisInventory->Service->rollback($productId, $quantity);
+                Log::warning("API error after Redis pre-deduction, rolling back stock.");
+            }
+
+            Log::error("Order request failed: " . $e->getMessage()); // 記錄錯誤
+
+            return response()->json([
+                ' => '訂單處理異常，請稍後再試。'
+            ], 500);
+        }
+    }
+}
+```
+
+**註解說明**：
+- 使用 Laravel 的驗證器確保請求參數有效。
+- 通過 `202 Accepted` 響應提升用戶體驗，實際處理交由隊列完成。
+- 異常處理確保 Redis 庫存回滾，避免數據不一致。
 
 ## 安裝說明
 1. 克隆儲存庫：
@@ -78,6 +306,7 @@ graph TD
    ```
    更新 `.env` 中的 MySQL 和 Redis 連線資訊，例如：
    ```env
+   myenv
    DB_CONNECTION=mysql
    DB_HOST=127.0.0.1
    DB_PORT=3306
@@ -118,7 +347,7 @@ graph TD
 | POST | `/api/place-order`            | 提交訂單，包含商品 ID、數量和用戶 ID |
 | POST | `/api/init-stock`             | 初始化商品和 Redis 庫存   |
 | GET  | `/api/get-redis-stock/{productId}` | 查詢 Redis 庫存         |
-| GET  | `/api/get-db-stock/{productId}`   | 查詢資料庫庫存          |
+| GET   | `/api/get-db-stock/{productId}`   | 查詢資料庫庫存          |
 
 **範例請求**（`POST /api/place-order`）：
 ```json
@@ -138,7 +367,7 @@ graph TD
 ```
 
 ## 測試
-執行測試以驗證系統可靠性：
+執行程式碼測試以驗證系統可靠性：
 ```bash
 php artisan test
 ```
@@ -148,7 +377,7 @@ php artisan test
 - API 端點（`OrderApiTest`）
 
 ## 性能估計
-在單台中低配伺服器（4 核心 8GB RAM，4 個 Queue 工作進程）下，系統估計每分鐘可處理 **1200-4800 次請求**（20-80 QPS）。若商品集中搶購，QPS 偏低；若商品分散，QPS 可接近上限。引入支付流程時，建議採用異步 Webhook 處理，確保支付失敗不影響主流程 QPS。
+在單台中低配伺服器（4 核心 8GB RAM，4 個 Queue 工作進程）下，系統估計每分鐘可處理 **1200-4800 次請求**（20-80 QPS）。若商品集中搶購，QPS 偏低；若商品分散，QPS 可接近上限。
 
 ## 專案目標
 本專案旨在展示：
@@ -156,9 +385,6 @@ php artisan test
 - **程式碼規範**：遵循 PSR-12 和 SOLID 原則，結構清晰。
 - **資料一致性**：多層防護確保庫存無誤。
 - **團隊協作**：提供流程圖、Swagger 文件和詳細安裝說明，便於理解與使用。
-
-## 貢獻
-歡迎提交 Issue 或 Pull Request！請先閱讀 [CONTRIBUTING.md](CONTRIBUTING.md)（可自行創建）。
 
 ## 授權
 [MIT License](LICENSE)
